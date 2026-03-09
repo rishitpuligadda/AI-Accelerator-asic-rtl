@@ -1,139 +1,67 @@
-module systolic #(parameter N = 2) (
-    input  logic clk,
-    input  logic rst,
-
-    input  logic [31:0] a[N],   // north inputs
-    input  logic [31:0] b[N],   // west inputs
-
-    output logic [63:0] c[N][N]
-);
-
-    logic [31:0] south[N][N];
-    logic [31:0] east[N][N];
-
+module systolic #(parameter s1 = 2, s2 = 2) (c, a, b, clk, rst);
+    output logic [63:0] c[s1][s2];
+    input logic [31:0] a[s2], b[s1];
+    input logic clk, rst;
+    logic [31:0] south[s1][s2], east[s1][s2];
     genvar i, j;
 
     generate
-        for (i = 0; i < N; i++) begin : ROW
-            for (j = 0; j < N; j++) begin : COL
-
+        for (i = 0; i < s1; i++) begin: ROW
+            for (j = 0; j < s2; j++) begin: COL
                 mac PE(
                     .clk(clk),
                     .rst(rst),
-
-                    .north( (i == 0) ? a[j] : south[i-1][j] ),
-                    .west ( (j == 0) ? b[i] : east[i][j-1] ),
-
+                    .north( (i == 0) ? a[j] : south[i-1][j]),
+                    .west( (j == 0) ? b[i] : east[i][j-1]),
+                    .east(east[i][j]),
                     .south(south[i][j]),
-                    .east (east[i][j]),
-
                     .result(c[i][j])
                 );
-
             end
         end
     endgenerate
-
 endmodule
 
-module sys_data #(parameter N = 2) (
-   output logic [63:0] z[N][N],
-    input  logic [31:0] x[N][N],
-    input  logic [31:0] y[N][N],
-    input  logic clk,
-    input  logic rst
-);
-
-    logic [31:0] a[N], b[N];
+module sys_data #(parameter s1 = 2, M = 2, s2 = 2) (z, x, y, clk, rst);
+    output logic [63:0] z[s1][s2];
+    input logic [31:0] x[s1][M], y[M][s2];
+    input logic clk, rst;
+    logic [31:0] a[s2], b[s1];
     integer t, i;
 
-    systolic #(N) dut (
+    systolic #(.s1(s1), .s2(s2)) array (
         .clk(clk),
         .rst(rst),
+        .c(z),
         .a(a),
-        .b(b),
-        .c(z)
+        .b(b)
     );
 
     always_ff @(posedge clk or posedge rst) begin
-        if (rst) begin
+        if (rst) begin 
             t <= 0;
 
-            for (i = 0; i < N; i++) begin
+            for (i = 0; i < s2; i++)
                 a[i] <= 0;
+            for (i = 0; i < s1; i++) 
                 b[i] <= 0;
-            end
         end
         else begin
-
-            for (i = 0; i < N; i++) begin
-                if (t-i >= 0 && t-i < N)
+            for (i = 0; i < s2; i++) begin
+                if (t-i >= 0 && t-i < M)
                     a[i] <= y[t-i][i];
                 else
                     a[i] <= 0;
-
-                if (t-i >= 0 && t-i < N)
+            end 
+            
+            for (i = 0; i < s1; i++) begin
+                if (t-i >= 0 && t-i < M)
                     b[i] <= x[i][t-i];
                 else
                     b[i] <= 0;
             end
-
+            
             t <= t + 1;
-
         end
     end
-
-endmodule
-
-module tb_sys3x3;
-
-    logic clk, rst;
-    logic [31:0] x[3][3], y[3][3];
-    logic [63:0] z[3][3];
-
-    sys_data #(.N(3)) dut(
-        .clk(clk),
-        .rst(rst),
-        .x(x),
-        .y(y),
-        .z(z)
-    );
-
-    always #5 clk = ~clk;
-
-    initial begin
-
-        clk = 0;
-        rst = 1;
-
-        x[0][0] = 1;  x[0][1] = 1; x[0][2] = 1;
-        x[1][0] = 1;  x[1][1] = 1; x[1][2] = 1;
-        x[2][0] = 1;  x[2][1] = 1; x[2][2] = 1;
-
-        y[0][0] = 1;  y[0][1] = 1; y[0][2] = 1;
-        y[1][0] = 1;  y[1][1] = 1; y[1][2] = 1;
-        y[2][0] = 1;  y[2][1] = 1; y[2][2] = 1;
-
-        $display("---- Watching wavefront feed ----");
-
-        $monitor("t=%0t | a0=%0d a1=%0d | b0=%0d b1=%0d || z00=%0d z01=%0d z10=%0d z11=%0d",
-                  $time,
-                  dut.a[0], dut.a[1],
-                  dut.b[0], dut.b[1],
-                  z[0][0], z[0][1], z[0][2], z[1][0], z[1][1], z[1][2], z[2][0], z[2][1], z[2][2]);
-
-        repeat(2) @(posedge clk);
-        rst = 0;
-
-        repeat(8) @(posedge clk);
-
-        $display("\nFinal Result Matrix:");
-        $display("%0d %0d %0d", z[0][0], z[0][1], z[0][2]);
-        $display("%0d %0d %0d", z[1][0], z[1][1], z[1][2]);
-        $display("%0d %0d %0d", z[2][0], z[2][1], z[2][2]);
-
-        $stop;
-
-    end
-
 endmodule
