@@ -1,8 +1,8 @@
 module systolic #(parameter s1 = 2, s2 = 2) (c, a, b, clk, rst);
-    output logic [63:0] c[s1][s2];
-    input logic [31:0] a[s2], b[s1];
+    output logic signed [63:0] c[s1][s2];
+    input logic signed [31:0] a[s2], b[s1];
     input logic clk, rst;
-    logic [31:0] south[s1][s2], east[s1][s2];
+    logic signed [31:0] south[s1][s2], east[s1][s2];
     genvar i, j;
 
     generate
@@ -23,10 +23,10 @@ module systolic #(parameter s1 = 2, s2 = 2) (c, a, b, clk, rst);
 endmodule
 
 module sys_data #(parameter s1 = 2, M = 2, s2 = 2) (z, x, y, clk, rst);
-    output logic [63:0] z[s1][s2];
-    input logic [31:0] x[s1][M], y[M][s2];
+    output logic signed [63:0] z[s1][s2];
+    input logic signed [31:0] x[s1][M], y[M][s2];
     input logic clk, rst;
-    logic [31:0] a[s2], b[s1];
+    logic signed [31:0] a[s2], b[s1];
     integer t, i;
 
     systolic #(.s1(s1), .s2(s2)) array (

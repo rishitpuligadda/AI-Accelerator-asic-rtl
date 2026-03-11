@@ -1,9 +1,9 @@
 module mac(south, east, result, north, west, clk, rst);
-    output logic [31:0] south, east;
-    output logic [63:0] result;
-    input logic [31:0] north, west;
+    output logic signed [31:0] south, east;
+    output logic signed [63:0] result;
+    input logic signed [31:0] north, west;
     input logic clk, rst;
-    logic [63:0] multi;
+    logic signed [63:0] multi;
         
     assign multi = north * west;
     

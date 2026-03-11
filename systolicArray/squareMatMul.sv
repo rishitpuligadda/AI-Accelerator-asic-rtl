@@ -2,14 +2,14 @@ module systolic_square #(parameter N = 2) (
     input  logic clk,
     input  logic rst,
 
-    input  logic [31:0] a[N],   // north inputs
-    input  logic [31:0] b[N],   // west inputs
+    input  logic signed [31:0] a[N],   // north inputs
+    input  logic signed [31:0] b[N],   // west inputs
 
-    output logic [63:0] c[N][N]
+    output logic signed [63:0] c[N][N]
 );
 
-    logic [31:0] south[N][N];
-    logic [31:0] east[N][N];
+    logic signed [31:0] south[N][N];
+    logic signed [31:0] east[N][N];
 
     genvar i, j;
 
@@ -37,14 +37,14 @@ module systolic_square #(parameter N = 2) (
 endmodule
 
 module sys_data_square #(parameter N = 2) (
-   output logic [63:0] z[N][N],
-    input  logic [31:0] x[N][N],
-    input  logic [31:0] y[N][N],
+   output logic signed [63:0] z[N][N],
+    input  logic signed [31:0] x[N][N],
+    input  logic signed [31:0] y[N][N],
     input  logic clk,
     input  logic rst
 );
 
-    logic [31:0] a[N], b[N];
+    logic signed [31:0] a[N], b[N];
     integer t, i;
 
     systolic_square #(N) dut (
@@ -88,8 +88,8 @@ endmodule
 module tb_sys3x3;
 
     logic clk, rst;
-    logic [31:0] x[3][3], y[3][3];
-    logic [63:0] z[3][3];
+    logic signed [31:0] x[3][3], y[3][3];
+    logic signed [63:0] z[3][3];
 
     sys_data_sqaure #(.N(3)) dut(
         .clk(clk),
