@@ -1,34 +1,43 @@
 // =============================================================================
-// systolic_pipe_conv.sv  ?  top-level shell
+// systolic_pipe_conv.sv  -  top-level shell
 //
 // Three submodules:
-//   bias_loader     ? loads bias values from DRAM once per inference
-//   dram_loader     ? fetches image (im2col) + weights from DRAM each tile
-//   compute_engine  ? owns everything else: tile iteration, master FSM,
-//                     SRAM read, feed, compute, write
+//   bias_loader     - loads REAL_K bias values from DRAM B once per inference
+//   dram_loader     - fetches activations (im2col) + weights per tile pass
+//   compute_engine  - tile iterator, master FSM, SRAM read, compute, write
 //
-// This module is purely wiring ? no logic of its own.
+// This module is purely structural - no logic of its own.
+//
+// Signal groups between submodules:
+//   bl_start / bl_done / bias_rf      : bias_loader <-> compute_engine
+//   dl_start / dl_load_ready           : compute_engine -> dram_loader handshake
+//   dl_row_tile .. dl_sram_a_base      : compute_engine -> dram_loader tile geometry
+//   dl_sram_a_* / dl_sram_b_*          : dram_loader SRAM port 0 signals, routed
+//                                         into compute_engine where the mux lives
+//
+// Port note: sram_*_dout0 ports are kept for standard SRAM interface compatibility
+// but are not used internally (all reads go through port 1).
 // =============================================================================
 
 module systolic_pipe_conv #(
-    parameter  TILE_MAX  = 4,
-    parameter  IN_H      = 4,
-    parameter  IN_W      = 4,
-    parameter  IN_C      = 1,
-    parameter  OUT_C     = 1,
-    parameter  K_H       = 3,
-    parameter  K_W       = 3,
-    parameter  STRIDE    = 1,
-    parameter  PAD       = 0,
-    parameter  AW        = 8,
-    parameter  BIAS_BASE = 16'd0,
+    parameter int TILE_MAX  = 4,
+    parameter int IN_H      = 4,
+    parameter int IN_W      = 4,
+    parameter int IN_C      = 1,
+    parameter int OUT_C     = 1,
+    parameter int K_H       = 3,
+    parameter int K_W       = 3,
+    parameter int STRIDE    = 1,
+    parameter int PAD       = 0,
+    parameter int AW        = 8,
+    parameter int BIAS_BASE = 0,
 
-    // Derived ? do not override
-    parameter  OUT_H  = (IN_H + 2*PAD - K_H) / STRIDE + 1,
-    parameter  OUT_W  = (IN_W + 2*PAD - K_W) / STRIDE + 1,
-    parameter  REAL_K = OUT_H * OUT_W,
-    parameter  REAL_M = K_H * K_W * IN_C,
-    parameter  REAL_N = OUT_C
+    // Derived - do not override
+    parameter int OUT_H  = (IN_H + 2*PAD - K_H) / STRIDE + 1,
+    parameter int OUT_W  = (IN_W + 2*PAD - K_W) / STRIDE + 1,
+    parameter int REAL_K = OUT_H * OUT_W,
+    parameter int REAL_M = K_H * K_W * IN_C,
+    parameter int REAL_N = OUT_C
 )(
     input  logic clk,
     input  logic rst,
@@ -39,23 +48,23 @@ module systolic_pipe_conv #(
     input  logic out_sel,
     input  logic skip_x,
 
-    // X DRAM ? image
+    // DRAM X - image activations
     output logic [15:0] ext_x_addr_o,
     output logic        ext_x_rd_en_o,
     input  logic [31:0] ext_x_data_i,
 
-    // Y DRAM ? weights
+    // DRAM Y - weights
     output logic [15:0] ext_y_addr_o,
     output logic        ext_y_rd_en_o,
     input  logic [31:0] ext_y_data_i,
 
-    // Z DRAM ? output (last layer only)
+    // DRAM Z - output (last layer)
     output logic [15:0] ext_z_addr_o,
     output logic        ext_z_wr_en_o,
     output logic [31:0] ext_z_data_o,
     output logic [3:0]  ext_z_wmask_o,
 
-    // B DRAM ? biases
+    // DRAM B - biases
     output logic [15:0] ext_b_addr_o,
     output logic        ext_b_rd_en_o,
     input  logic [31:0] ext_b_data_i,
@@ -65,7 +74,7 @@ module systolic_pipe_conv #(
     output logic [3:0]    sram_a_wmask0,
     output logic [AW-1:0] sram_a_addr0,
     output logic [31:0]   sram_a_din0,
-    input  logic [31:0]   sram_a_dout0,
+    input  logic [31:0]   sram_a_dout0,   // unused internally, kept for interface
     output logic          sram_a_csb1,
     output logic [AW-1:0] sram_a_addr1,
     input  logic [31:0]   sram_a_dout1,
@@ -75,7 +84,7 @@ module systolic_pipe_conv #(
     output logic [3:0]    sram_b_wmask0,
     output logic [AW-1:0] sram_b_addr0,
     output logic [31:0]   sram_b_din0,
-    input  logic [31:0]   sram_b_dout0,
+    input  logic [31:0]   sram_b_dout0,   // unused internally, kept for interface
     output logic          sram_b_csb1,
     output logic [AW-1:0] sram_b_addr1,
     input  logic [31:0]   sram_b_dout1,
@@ -85,21 +94,21 @@ module systolic_pipe_conv #(
     output logic [3:0]    sram_c_wmask0,
     output logic [AW-1:0] sram_c_addr0,
     output logic [31:0]   sram_c_din0,
-    input  logic [31:0]   sram_c_dout0,
+    input  logic [31:0]   sram_c_dout0,   // unused internally, kept for interface
     output logic          sram_c_csb1,
     output logic [AW-1:0] sram_c_addr1,
     input  logic [31:0]   sram_c_dout1
 );
 
     // -------------------------------------------------------------------------
-    // Internal wires between submodules
+    // bias_loader <-> compute_engine
     // -------------------------------------------------------------------------
-
-    // bias_loader ? compute_engine
     logic        bl_start, bl_done;
     logic signed [31:0] bias_rf [REAL_K];
 
-    // compute_engine ? dram_loader (tile geometry + control)
+    // -------------------------------------------------------------------------
+    // compute_engine <-> dram_loader  (tile geometry + control)
+    // -------------------------------------------------------------------------
     logic        dl_start, dl_load_ready;
     logic [$clog2(REAL_K):0]        dl_row_tile;
     logic [$clog2(REAL_N):0]        dl_col_tile;
@@ -107,7 +116,7 @@ module systolic_pipe_conv #(
     logic [5:0]    dl_words_a, dl_words_b;
     logic [AW-1:0] dl_sram_a_base;
 
-    // dram_loader ? compute_engine (SRAM port 0 signals, muxed inside CE)
+    // dram_loader SRAM port 0 outputs, routed through compute_engine mux
     logic          dl_sram_a_csb0, dl_sram_a_web0;
     logic [3:0]    dl_sram_a_wmask0;
     logic [AW-1:0] dl_sram_a_addr0;
@@ -169,18 +178,15 @@ module systolic_pipe_conv #(
         .is_last_layer(is_last_layer), .act_sel(act_sel),
         .out_sel(out_sel), .skip_x(skip_x),
 
-        // bias loader interface
         .bl_start_o(bl_start), .bl_done_i(bl_done),
         .bias_rf_i(bias_rf),
 
-        // dram loader interface
         .dl_start_o(dl_start), .dl_load_ready_i(dl_load_ready),
         .dl_row_tile_o(dl_row_tile), .dl_col_tile_o(dl_col_tile),
         .dl_eff_rows_o(dl_eff_rows), .dl_eff_cols_o(dl_eff_cols),
         .dl_words_a_o(dl_words_a), .dl_words_b_o(dl_words_b),
         .dl_sram_a_base_o(dl_sram_a_base),
 
-        // dram_loader SRAM port 0 signals (muxed inside compute_engine)
         .dl_sram_a_csb0(dl_sram_a_csb0), .dl_sram_a_web0(dl_sram_a_web0),
         .dl_sram_a_wmask0(dl_sram_a_wmask0), .dl_sram_a_addr0(dl_sram_a_addr0),
         .dl_sram_a_din0(dl_sram_a_din0),
@@ -188,7 +194,6 @@ module systolic_pipe_conv #(
         .dl_sram_b_wmask0(dl_sram_b_wmask0), .dl_sram_b_addr0(dl_sram_b_addr0),
         .dl_sram_b_din0(dl_sram_b_din0),
 
-        // SRAM port 0 outputs (muxed)
         .sram_a_csb0(sram_a_csb0), .sram_a_web0(sram_a_web0),
         .sram_a_wmask0(sram_a_wmask0), .sram_a_addr0(sram_a_addr0),
         .sram_a_din0(sram_a_din0),
@@ -199,7 +204,6 @@ module systolic_pipe_conv #(
         .sram_c_wmask0(sram_c_wmask0), .sram_c_addr0(sram_c_addr0),
         .sram_c_din0(sram_c_din0),
 
-        // SRAM port 1 (read)
         .sram_a_csb1(sram_a_csb1), .sram_a_addr1(sram_a_addr1),
         .sram_a_dout1(sram_a_dout1),
         .sram_b_csb1(sram_b_csb1), .sram_b_addr1(sram_b_addr1),
@@ -207,7 +211,6 @@ module systolic_pipe_conv #(
         .sram_c_csb1(sram_c_csb1), .sram_c_addr1(sram_c_addr1),
         .sram_c_dout1(sram_c_dout1),
 
-        // DRAM Z output
         .ext_z_addr_o(ext_z_addr_o), .ext_z_wr_en_o(ext_z_wr_en_o),
         .ext_z_data_o(ext_z_data_o), .ext_z_wmask_o(ext_z_wmask_o)
     );

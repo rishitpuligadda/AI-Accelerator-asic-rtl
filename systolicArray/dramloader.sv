@@ -1,17 +1,48 @@
 // =============================================================================
-// dram_loader_conv.sv  (v4 - byte-by-byte weight fetch)
+// dram_loader.sv  (v5 - dual parallel pipelined fetch)
 //
-// Im2col fetch (activations): unchanged 2-state pump REQ ? RSP.
+// Optimisation 1: Pipelined byte fetch (1 cycle per byte instead of 2)
+//   Each pipeline uses a 2-stage structure:
+//     Cycle N  : compute address, issue DRAM read  (stage 0 = issue)
+//     Cycle N+1: receive data from DRAM            (stage 1 = receive)
+//   While stage 1 is receiving byte[k], stage 0 is already issuing addr[k+1].
+//   Net throughput: 1 cycle per byte after a 1-cycle fill penalty.
 //
-// Weight fetch (weights): now also a 2-state byte pump REQ_B ? RSP_B.
-//   For a tile at col_tile with eff_cols filters, the weight byte for
-//   tap t, tile-local column c is stored at DRAM Y byte address:
-//       t * REAL_N + col_tile + c
-//   These bytes are NOT contiguous when REAL_N > eff_cols (i.e. when
-//   the filter dimension is tiled), so a word-level sequential fetch
-//   picks up the wrong bytes.  The byte pump reads each weight byte
-//   individually and packs them into SRAM B in tap-major, col-minor
-//   order, exactly matching what MS_READ_B in compute_engine expects.
+// Optimisation 2: Parallel activation + weight fetch
+//   Activations read from DRAM X into SRAM A.
+//   Weights    read from DRAM Y into SRAM B.
+//   These use completely separate DRAM buses and separate SRAM ports, so they
+//   run simultaneously from the moment start_i fires.
+//   load_ready_o is asserted when BOTH pipelines have finished.
+//
+// Combined speedup (typical tile):
+//   Before: 2*(act_bytes + wt_bytes) cycles (sequential, 2 per byte)
+//   After:  max(act_bytes, wt_bytes) + 1 cycles (parallel, 1 per byte)
+//   Example: 36-byte act + 36-byte wt -> 144 cycles -> 37 cycles (~3.9x)
+//
+// Pipeline states (two independent FSMs):
+//   Activation: ACT_IDLE -> ACT_PIPE -> ACT_DRAIN -> [ACT_FLUSH ->] ACT_DONE
+//   Weight:     WT_IDLE  -> WT_PIPE  -> WT_DRAIN  -> [WT_FLUSH  ->] WT_DONE
+//
+// ACT_PIPE / WT_PIPE (steady-state, one byte per cycle):
+//   Each cycle:
+//     1. If stage-1 pipeline register is valid: extract byte from DRAM data,
+//        pack it, flush to SRAM when 4 bytes accumulate.
+//     2. If there are remaining bytes to issue: compute next address,
+//        drive DRAM read enable, update stage-1 pipeline register.
+//     3. When the last address has been issued, move to DRAIN on the next cycle.
+//
+// ACT_DRAIN / WT_DRAIN (1 cycle, receive the last in-flight byte):
+//   Receive and pack the final byte (stage-1 is still valid).
+//   Move to FLUSH if a partial word is sitting in the pack buffer, else DONE.
+//
+// ACT_FLUSH / WT_FLUSH (1 cycle, write the partial last word):
+//   Drive the SRAM write with the remaining pack bytes, advance wr pointer.
+//   Move to DONE.
+//
+// ACT_DONE / WT_DONE:
+//   Pipeline is finished. When both reach DONE, load_ready_o pulses for 1 cycle
+//   and both pipelines return to IDLE.
 // =============================================================================
 
 module dram_loader #(
@@ -66,82 +97,85 @@ module dram_loader #(
 );
 
     // -------------------------------------------------------------------------
-    // Derived
+    // Derived constants
     // -------------------------------------------------------------------------
     localparam int OUT_W = (IN_W + 2*PAD - K_W) / STRIDE + 1;
 
     // -------------------------------------------------------------------------
-    // FSM states
+    // Activation pipeline FSM states
     // -------------------------------------------------------------------------
     typedef enum logic [2:0] {
-        LS_IDLE      = 3'd0,
-        LS_FETCH_REQ = 3'd1,   // activation fetch: compute address
-        LS_FETCH_RSP = 3'd2,   // activation fetch: receive byte, pack, flush
-        LS_FLUSH     = 3'd3,   // flush partial activation word
-        LS_FETCH_B_REQ = 3'd4, // weight fetch:     compute address
-        LS_FETCH_B_RSP = 3'd5, // weight fetch:     receive byte, pack, flush
-        LS_FLUSH_B   = 3'd6,   // flush partial weight word
-        LS_READY     = 3'd7
-    } ls_t;
-    ls_t ls_state;
+        ACT_IDLE  = 3'd0,
+        ACT_PIPE  = 3'd1,
+        ACT_DRAIN = 3'd2,
+        ACT_FLUSH = 3'd3,
+        ACT_DONE  = 3'd4
+    } act_t;
+    act_t act_state;
 
     // -------------------------------------------------------------------------
-    // Latched tile geometry
+    // Weight pipeline FSM states
+    // -------------------------------------------------------------------------
+    typedef enum logic [2:0] {
+        WT_IDLE  = 3'd0,
+        WT_PIPE  = 3'd1,
+        WT_DRAIN = 3'd2,
+        WT_FLUSH = 3'd3,
+        WT_DONE  = 3'd4
+    } wt_t;
+    wt_t wt_state;
+
+    // -------------------------------------------------------------------------
+    // Latched tile geometry (captured on start_i)
     // -------------------------------------------------------------------------
     logic [$clog2(REAL_K):0]       lat_row_tile;
     logic [$clog2(REAL_N):0]       lat_col_tile;
     logic [$clog2(TILE_MAX+1)-1:0] lat_eff_rows;
     logic [$clog2(TILE_MAX+1)-1:0] lat_eff_cols;
-    logic [5:0]    lat_words_a, lat_words_b;
-    logic [AW-1:0] lat_sram_a_base;
+    logic [AW-1:0]                 lat_sram_a_base;
+
+    // Total bytes each pipeline must transfer for this tile
+    // Computed combinationally from latched geometry, used during ACT_PIPE/WT_PIPE
+    logic [7:0] act_total;   // eff_rows * REAL_M
+    logic [7:0] wt_total;    // REAL_M * eff_cols
+    always_comb begin
+        act_total = 8'(int'(lat_eff_rows) * REAL_M);
+        wt_total  = 8'(REAL_M * int'(lat_eff_cols));
+    end
 
     // -------------------------------------------------------------------------
-    // Im2col position (activation fetch)
+    // Activation pipeline: issue-side counters and stage-1 register
     // -------------------------------------------------------------------------
-    logic [5:0] ic_row;
-    logic [5:0] ic_col;
+    logic [7:0] act_issue_cnt;  // counts bytes issued so far (0..act_total-1)
+    logic [5:0] act_ic_row;     // im2col row being issued (0..eff_rows-1)
+    logic [5:0] act_ic_col;     // im2col col being issued (0..REAL_M-1)
 
-    // Latched from REQ state for use in RSP state
-    logic        is_pad;
-    logic [1:0]  src_byte_lane;
+    logic        act_s1_valid;      // stage-1 pipeline register: was a read issued?
+    logic        act_s1_is_pad;     // was the issued address a pad position?
+    logic [1:0]  act_s1_byte_lane;  // byte lane of the issued read
 
-    // -------------------------------------------------------------------------
-    // Weight fetch position
-    // -------------------------------------------------------------------------
-    logic [5:0] wt_tap;   // current tap index (0..REAL_M-1)
-    logic [2:0] wt_col;   // current tile-local column (0..eff_cols-1)
-    logic [1:0] wt_byte_lane;  // byte lane within the fetched DRAM word
-
-    // -------------------------------------------------------------------------
-    // Shared pack buffer ? used for both activation and weight packing
-    // -------------------------------------------------------------------------
-    logic [7:0]  pack_b0, pack_b1, pack_b2, pack_b3;
-    logic [1:0]  pack_lane;
-
-    // SRAM A write address (activation packing)
-    logic [AW-1:0] sram_a_wr;
-
-    // SRAM B write address (weight packing)
-    logic [AW-1:0] sram_b_wr;
+    // Activation pack buffer (independent of weight pack)
+    logic [7:0]  act_pb0, act_pb1, act_pb2, act_pb3;
+    logic [1:0]  act_pack_lane;
+    logic [AW-1:0] act_sram_wr;     // next SRAM A word address to write
 
     // -------------------------------------------------------------------------
-    // SRAM A write control (combinational ? driven from RSP / FLUSH states)
+    // Weight pipeline: issue-side counters and stage-1 register
     // -------------------------------------------------------------------------
-    logic        do_write_a;
-    logic [31:0] write_word_a;
-    logic [3:0]  write_mask_a;
-    logic [AW-1:0] write_addr_a;
+    logic [7:0] wt_issue_cnt;  // counts bytes issued so far (0..wt_total-1)
+    logic [5:0] wt_tap;        // tap being issued (0..REAL_M-1)
+    logic [2:0] wt_col;        // tile-local column being issued (0..eff_cols-1)
+
+    logic        wt_s1_valid;
+    logic [1:0]  wt_s1_byte_lane;
+
+    // Weight pack buffer
+    logic [7:0]  wt_pb0, wt_pb1, wt_pb2, wt_pb3;
+    logic [1:0]  wt_pack_lane;
+    logic [AW-1:0] wt_sram_wr;     // next SRAM B word address to write
 
     // -------------------------------------------------------------------------
-    // SRAM B write control (combinational ? driven from RSP_B / FLUSH_B states)
-    // -------------------------------------------------------------------------
-    logic        do_write_b;
-    logic [31:0] write_word_b;
-    logic [3:0]  write_mask_b;
-    logic [AW-1:0] write_addr_b;
-
-    // -------------------------------------------------------------------------
-    // Im2col address helper
+    // Address helper functions (purely combinational, same as v4)
     // -------------------------------------------------------------------------
     function automatic void get_im2col(
         input  int row_tile_in, ic_r, ic_c,
@@ -149,8 +183,7 @@ module dram_loader #(
         output logic [15:0] word_addr_out,
         output logic [1:0]  byte_lane_out
     );
-        int glob_row, oh, ow, ic_ch, kh_i, kw_i;
-        int src_h, src_w, byte_addr;
+        int glob_row, oh, ow, ic_ch, kh_i, kw_i, src_h, src_w, byte_addr;
         glob_row = row_tile_in + ic_r;
         oh       = glob_row / OUT_W;
         ow       = glob_row % OUT_W;
@@ -171,12 +204,6 @@ module dram_loader #(
         end
     endfunction
 
-    // -------------------------------------------------------------------------
-    // Weight byte address helper
-    //   byte_addr = tap * REAL_N + col_tile + tile_local_col
-    //   word_addr = byte_addr >> 2
-    //   lane      = byte_addr  & 3
-    // -------------------------------------------------------------------------
     function automatic void get_weight_addr(
         input  int tap_in, col_tile_in, tile_col_in,
         output logic [15:0] word_addr_out,
@@ -189,303 +216,327 @@ module dram_loader #(
     endfunction
 
     // =========================================================================
-    // Sequential FSM
+    // ACTIVATION PIPELINE ? sequential
     // =========================================================================
     always_ff @(posedge clk or posedge rst) begin
         if (rst) begin
-            ls_state        <= LS_IDLE;
-            ic_row          <= '0;
-            ic_col          <= '0;
-            wt_tap          <= '0;
-            wt_col          <= '0;
-            wt_byte_lane    <= '0;
-            is_pad          <= 1'b0;
-            src_byte_lane   <= '0;
-            pack_b0         <= '0;
-            pack_b1         <= '0;
-            pack_b2         <= '0;
-            pack_b3         <= '0;
-            pack_lane       <= '0;
-            sram_a_wr       <= '0;
-            sram_b_wr       <= '0;
-            lat_row_tile    <= '0;
-            lat_col_tile    <= '0;
-            lat_eff_rows    <= '0;
-            lat_eff_cols    <= '0;
-            lat_words_a     <= '0;
-            lat_words_b     <= '0;
-            lat_sram_a_base <= '0;
-            load_ready_o    <= 1'b0;
-            busy_o          <= 1'b0;
+            act_state      <= ACT_IDLE;
+            act_issue_cnt  <= '0;
+            act_ic_row     <= '0;
+            act_ic_col     <= '0;
+            act_s1_valid   <= 1'b0;
+            act_s1_is_pad  <= 1'b0;
+            act_s1_byte_lane <= '0;
+            act_pb0        <= '0; act_pb1 <= '0;
+            act_pb2        <= '0; act_pb3 <= '0;
+            act_pack_lane  <= '0;
+            act_sram_wr    <= '0;
         end else begin
-            load_ready_o <= 1'b0;
+            case (act_state)
 
-            case (ls_state)
-
-                // -------------------------------------------------------------
-                LS_IDLE: begin
-                    busy_o <= 1'b0;
+                // ---------------------------------------------------------
+                ACT_IDLE: begin
+                    act_s1_valid <= 1'b0;
                     if (start_i) begin
-                        lat_row_tile    <= row_tile_i;
-                        lat_col_tile    <= col_tile_i;
-                        lat_eff_rows    <= eff_rows_i;
-                        lat_eff_cols    <= eff_cols_i;
-                        lat_words_a     <= words_a_i;
-                        lat_words_b     <= words_b_i;
-                        lat_sram_a_base <= sram_a_base_i;
-                        ic_row          <= '0;
-                        ic_col          <= '0;
-                        wt_tap          <= '0;
-                        wt_col          <= '0;
-                        pack_b0         <= '0;
-                        pack_b1         <= '0;
-                        pack_b2         <= '0;
-                        pack_b3         <= '0;
-                        pack_lane       <= '0;
-                        sram_a_wr       <= sram_a_base_i;
-                        sram_b_wr       <= '0;
-                        busy_o          <= 1'b1;
-                        ls_state        <= skip_x_i ? LS_FETCH_B_REQ : LS_FETCH_REQ;
+                        act_ic_row    <= '0;
+                        act_ic_col    <= '0;
+                        act_issue_cnt <= '0;
+                        act_pb0       <= '0; act_pb1 <= '0;
+                        act_pb2       <= '0; act_pb3 <= '0;
+                        act_pack_lane <= '0;
+                        act_sram_wr   <= sram_a_base_i;
+                        if (skip_x_i) begin
+                            act_s1_valid <= 1'b0;
+                            act_state    <= ACT_DONE;
+                        end else begin
+                            act_state <= ACT_PIPE;
+                        end
                     end
                 end
 
-                // =============================================================
-                // ACTIVATION FETCH  (unchanged from v3)
-                // =============================================================
-
-                LS_FETCH_REQ: begin
-                    begin
-                        logic        p;
-                        logic [15:0] wa;
-                        logic [1:0]  bl;
-                        get_im2col(int'(lat_row_tile), int'(ic_row),
-                                   int'(ic_col), p, wa, bl);
-                        is_pad        <= p;
-                        src_byte_lane <= bl;
-                    end
-                    ls_state <= LS_FETCH_RSP;
-                end
-
-                LS_FETCH_RSP: begin
-                    begin
+                // ---------------------------------------------------------
+                // Steady-state: one byte received, one address issued per cycle
+                // ---------------------------------------------------------
+                ACT_PIPE: begin
+                    // ---- Stage 1: receive the byte issued last cycle ----
+                    if (act_s1_valid) begin
                         logic [7:0] bval;
-                        bval = is_pad ? 8'h00
-                                      : ext_x_data_i[int'(src_byte_lane)*8 +: 8];
-
-                        case (pack_lane)
-                            2'd0: pack_b0 <= bval;
-                            2'd1: pack_b1 <= bval;
-                            2'd2: pack_b2 <= bval;
-                            2'd3: pack_b3 <= bval;
+                        bval = act_s1_is_pad ? 8'h00
+                                             : ext_x_data_i[int'(act_s1_byte_lane)*8 +: 8];
+                        case (act_pack_lane)
+                            2'd0: act_pb0 <= bval;
+                            2'd1: act_pb1 <= bval;
+                            2'd2: act_pb2 <= bval;
+                            2'd3: act_pb3 <= bval;
                         endcase
-
-                        if (pack_lane == 2'd3) begin
-                            sram_a_wr <= AW'(int'(sram_a_wr) + 1);
-                            pack_b0   <= '0;
-                            pack_b1   <= '0;
-                            pack_b2   <= '0;
-                            pack_b3   <= '0;
-                            pack_lane <= '0;
+                        if (act_pack_lane == 2'd3) begin
+                            act_sram_wr   <= AW'(int'(act_sram_wr) + 1);
+                            act_pb0       <= '0; act_pb1 <= '0;
+                            act_pb2       <= '0; act_pb3 <= '0;
+                            act_pack_lane <= '0;
                         end else begin
-                            pack_lane <= pack_lane + 2'd1;
+                            act_pack_lane <= act_pack_lane + 2'd1;
                         end
+                    end
 
-                        if (int'(ic_col) == REAL_M - 1) begin
-                            ic_col <= '0;
-                            if (int'(ic_row) == int'(lat_eff_rows) - 1) begin
-                                ic_row <= '0;
-                                if (pack_lane != 2'd3)
-                                    ls_state <= LS_FLUSH;
-                                else begin
-                                    // Start weight fetch
-                                    pack_b0   <= '0;
-                                    pack_b1   <= '0;
-                                    pack_b2   <= '0;
-                                    pack_b3   <= '0;
-                                    pack_lane <= '0;
-                                    ls_state  <= LS_FETCH_B_REQ;
-                                end
-                            end else begin
-                                ic_row   <= 6'(int'(ic_row) + 1);
-                                ls_state <= LS_FETCH_REQ;
-                            end
-                        end else begin
-                            ic_col   <= 6'(int'(ic_col) + 1);
-                            ls_state <= LS_FETCH_REQ;
+                    // ---- Stage 0: issue next address ----
+                    if (int'(act_issue_cnt) < int'(act_total)) begin
+                        // Issue address for current (ic_row, ic_col)
+                        // (ext_x_rd_en_o / ext_x_addr_o driven combinationally below)
+                        begin
+                            logic        p;
+                            logic [15:0] wa;
+                            logic [1:0]  bl;
+                            get_im2col(int'(lat_row_tile), int'(act_ic_row),
+                                       int'(act_ic_col), p, wa, bl);
+                            act_s1_valid     <= 1'b1;
+                            act_s1_is_pad    <= p;
+                            act_s1_byte_lane <= bl;
                         end
+                        // Advance im2col counters
+                        if (int'(act_ic_col) == REAL_M - 1) begin
+                            act_ic_col <= '0;
+                            act_ic_row <= 6'(int'(act_ic_row) + 1);
+                        end else begin
+                            act_ic_col <= 6'(int'(act_ic_col) + 1);
+                        end
+                        act_issue_cnt <= 8'(int'(act_issue_cnt) + 1);
+
+                        // If this was the last byte to issue, next cycle is DRAIN
+                        if (int'(act_issue_cnt) == int'(act_total) - 1)
+                            act_state <= ACT_DRAIN;
+                    end else begin
+                        act_s1_valid <= 1'b0;
                     end
                 end
 
-                LS_FLUSH: begin
-                    // Flush partial activation word
-                    sram_a_wr <= AW'(int'(sram_a_wr) + 1);
-                    pack_b0   <= '0;
-                    pack_b1   <= '0;
-                    pack_b2   <= '0;
-                    pack_b3   <= '0;
-                    pack_lane <= '0;
-                    ls_state  <= LS_FETCH_B_REQ;
-                end
-
-                // =============================================================
-                // WEIGHT FETCH  (new byte-by-byte pump)
-                // =============================================================
-
-                LS_FETCH_B_REQ: begin
-                    // Compute DRAM Y address for (wt_tap, wt_col) and latch lane
-                    begin
-                        logic [15:0] wa;
-                        logic [1:0]  bl;
-                        get_weight_addr(int'(wt_tap),
-                                        int'(lat_col_tile),
-                                        int'(wt_col),
-                                        wa, bl);
-                        wt_byte_lane <= bl;
-                        // ext_y_rd_en and ext_y_addr driven combinationally below
-                    end
-                    ls_state <= LS_FETCH_B_RSP;
-                end
-
-                LS_FETCH_B_RSP: begin
-                    begin
+                // ---------------------------------------------------------
+                // Drain: receive the final in-flight byte, no new issue
+                // ---------------------------------------------------------
+                ACT_DRAIN: begin
+                    act_s1_valid <= 1'b0;
+                    if (act_s1_valid) begin
                         logic [7:0] bval;
-                        bval = ext_y_data_i[int'(wt_byte_lane)*8 +: 8];
-
-                        case (pack_lane)
-                            2'd0: pack_b0 <= bval;
-                            2'd1: pack_b1 <= bval;
-                            2'd2: pack_b2 <= bval;
-                            2'd3: pack_b3 <= bval;
+                        bval = act_s1_is_pad ? 8'h00
+                                             : ext_x_data_i[int'(act_s1_byte_lane)*8 +: 8];
+                        case (act_pack_lane)
+                            2'd0: act_pb0 <= bval;
+                            2'd1: act_pb1 <= bval;
+                            2'd2: act_pb2 <= bval;
+                            2'd3: act_pb3 <= bval;
                         endcase
-
-                        if (pack_lane == 2'd3) begin
-                            sram_b_wr <= AW'(int'(sram_b_wr) + 1);
-                            pack_b0   <= '0;
-                            pack_b1   <= '0;
-                            pack_b2   <= '0;
-                            pack_b3   <= '0;
-                            pack_lane <= '0;
+                        if (act_pack_lane == 2'd3) begin
+                            act_sram_wr   <= AW'(int'(act_sram_wr) + 1);
+                            act_pb0       <= '0; act_pb1 <= '0;
+                            act_pb2       <= '0; act_pb3 <= '0;
+                            act_pack_lane <= '0;
+                            act_state     <= ACT_DONE;
                         end else begin
-                            pack_lane <= pack_lane + 2'd1;
+                            act_pack_lane <= act_pack_lane + 2'd1;
+                            act_state     <= ACT_FLUSH;
                         end
-
-                        // Advance weight position counters
-                        if (int'(wt_col) == int'(lat_eff_cols) - 1) begin
-                            wt_col <= '0;
-                            if (int'(wt_tap) == REAL_M - 1) begin
-                                // All weight bytes fetched
-                                wt_tap <= '0;
-                                if (pack_lane != 2'd3)
-                                    ls_state <= LS_FLUSH_B;
-                                else begin
-                                    pack_b0      <= '0;
-                                    pack_b1      <= '0;
-                                    pack_b2      <= '0;
-                                    pack_b3      <= '0;
-                                    pack_lane    <= '0;
-                                    load_ready_o <= 1'b1;
-                                    ls_state     <= LS_READY;
-                                end
-                            end else begin
-                                wt_tap   <= 6'(int'(wt_tap) + 1);
-                                ls_state <= LS_FETCH_B_REQ;
-                            end
-                        end else begin
-                            wt_col   <= 3'(int'(wt_col) + 1);
-                            ls_state <= LS_FETCH_B_REQ;
-                        end
+                    end else begin
+                        // s1 was not valid (act_total == 0 edge case)
+                        act_state <= (act_pack_lane != 2'd0) ? ACT_FLUSH : ACT_DONE;
                     end
                 end
 
-                LS_FLUSH_B: begin
-                    // Flush partial weight word
-                    sram_b_wr    <= AW'(int'(sram_b_wr) + 1);
-                    pack_b0      <= '0;
-                    pack_b1      <= '0;
-                    pack_b2      <= '0;
-                    pack_b3      <= '0;
-                    pack_lane    <= '0;
-                    load_ready_o <= 1'b1;
-                    ls_state     <= LS_READY;
+                // ---------------------------------------------------------
+                // Flush: write the remaining partial word to SRAM A
+                // (combinational block drives the SRAM write this cycle)
+                // ---------------------------------------------------------
+                ACT_FLUSH: begin
+                    act_sram_wr   <= AW'(int'(act_sram_wr) + 1);
+                    act_pb0       <= '0; act_pb1 <= '0;
+                    act_pb2       <= '0; act_pb3 <= '0;
+                    act_pack_lane <= '0;
+                    act_state     <= ACT_DONE;
                 end
 
-                LS_READY: begin
-                    busy_o   <= 1'b0;
-                    ls_state <= LS_IDLE;
+                // ---------------------------------------------------------
+                ACT_DONE: begin
+                    // Wait here until both pipelines done (handled in output logic)
+                    // Return to IDLE is triggered by the load_ready pulse
+                    if (load_ready_o)
+                        act_state <= ACT_IDLE;
                 end
 
-                default: ls_state <= LS_IDLE;
+                default: act_state <= ACT_IDLE;
             endcase
         end
     end
 
-
     // =========================================================================
-    // Combinational: SRAM A write
-    //
-    // Written on LS_FETCH_RSP when pack_lane==3 (full word ready),
-    // and on LS_FLUSH for the final partial word.
-    // Current byte is NOT yet in pack_bX (updates at next posedge), so
-    // we compute it inline here.
+    // WEIGHT PIPELINE ? sequential
     // =========================================================================
-    always_comb begin
-        do_write_a   = 1'b0;
-        write_word_a = '0;
-        write_mask_a = '0;
-        write_addr_a = sram_a_wr;
+    always_ff @(posedge clk or posedge rst) begin
+        if (rst) begin
+            wt_state       <= WT_IDLE;
+            wt_issue_cnt   <= '0;
+            wt_tap         <= '0;
+            wt_col         <= '0;
+            wt_s1_valid    <= 1'b0;
+            wt_s1_byte_lane <= '0;
+            wt_pb0         <= '0; wt_pb1 <= '0;
+            wt_pb2         <= '0; wt_pb3 <= '0;
+            wt_pack_lane   <= '0;
+            wt_sram_wr     <= '0;
+        end else begin
+            case (wt_state)
 
-        sram_a_csb0   = 1'b1;
-        sram_a_web0   = 1'b1;
-        sram_a_wmask0 = 4'hF;
-        sram_a_addr0  = '0;
-        sram_a_din0   = '0;
+                // ---------------------------------------------------------
+                WT_IDLE: begin
+                    wt_s1_valid <= 1'b0;
+                    if (start_i) begin
+                        wt_tap        <= '0;
+                        wt_col        <= '0;
+                        wt_issue_cnt  <= '0;
+                        wt_pb0        <= '0; wt_pb1 <= '0;
+                        wt_pb2        <= '0; wt_pb3 <= '0;
+                        wt_pack_lane  <= '0;
+                        wt_sram_wr    <= '0;
+                        wt_state      <= WT_PIPE;
+                    end
+                end
 
-        if (ls_state == LS_FLUSH) begin
-            automatic logic [31:0] flush_word;
-            flush_word    = {pack_b3, pack_b2, pack_b1, pack_b0};
-            sram_a_csb0   = 1'b0;
-            sram_a_web0   = 1'b0;
-            sram_a_wmask0 = 4'hF;
-            sram_a_addr0  = sram_a_wr;
-            sram_a_din0   = flush_word;
-        end else if (ls_state == LS_FETCH_RSP) begin
-            automatic logic [7:0] bval_c;
-            bval_c = is_pad ? 8'h00
-                            : ext_x_data_i[int'(src_byte_lane)*8 +: 8];
+                // ---------------------------------------------------------
+                WT_PIPE: begin
+                    // ---- Stage 1: receive the byte issued last cycle ----
+                    if (wt_s1_valid) begin
+                        logic [7:0] bval;
+                        bval = ext_y_data_i[int'(wt_s1_byte_lane)*8 +: 8];
+                        case (wt_pack_lane)
+                            2'd0: wt_pb0 <= bval;
+                            2'd1: wt_pb1 <= bval;
+                            2'd2: wt_pb2 <= bval;
+                            2'd3: wt_pb3 <= bval;
+                        endcase
+                        if (wt_pack_lane == 2'd3) begin
+                            wt_sram_wr   <= AW'(int'(wt_sram_wr) + 1);
+                            wt_pb0       <= '0; wt_pb1 <= '0;
+                            wt_pb2       <= '0; wt_pb3 <= '0;
+                            wt_pack_lane <= '0;
+                        end else begin
+                            wt_pack_lane <= wt_pack_lane + 2'd1;
+                        end
+                    end
 
-            if (pack_lane == 2'd3) begin
-                write_word_a = {pack_b3, pack_b2, pack_b1, pack_b0};
-                case (pack_lane)
-                    2'd0: write_word_a[ 7: 0] = bval_c;
-                    2'd1: write_word_a[15: 8] = bval_c;
-                    2'd2: write_word_a[23:16] = bval_c;
-                    2'd3: write_word_a[31:24] = bval_c;
-                endcase
-                write_mask_a = 4'hF;
-                write_addr_a = sram_a_wr;
-                do_write_a   = 1'b1;
+                    // ---- Stage 0: issue next weight address ----
+                    if (int'(wt_issue_cnt) < int'(wt_total)) begin
+                        begin
+                            logic [15:0] wa;
+                            logic [1:0]  bl;
+                            get_weight_addr(int'(wt_tap), int'(lat_col_tile),
+                                            int'(wt_col), wa, bl);
+                            wt_s1_valid     <= 1'b1;
+                            wt_s1_byte_lane <= bl;
+                        end
+                        // Advance weight counters (col-major within tap)
+                        if (int'(wt_col) == int'(lat_eff_cols) - 1) begin
+                            wt_col <= '0;
+                            wt_tap <= 6'(int'(wt_tap) + 1);
+                        end else begin
+                            wt_col <= 3'(int'(wt_col) + 1);
+                        end
+                        wt_issue_cnt <= 8'(int'(wt_issue_cnt) + 1);
 
-                sram_a_csb0   = 1'b0;
-                sram_a_web0   = 1'b0;
-                sram_a_wmask0 = 4'hF;
-                sram_a_addr0  = write_addr_a;
-                sram_a_din0   = write_word_a;
-            end
+                        if (int'(wt_issue_cnt) == int'(wt_total) - 1)
+                            wt_state <= WT_DRAIN;
+                    end else begin
+                        wt_s1_valid <= 1'b0;
+                    end
+                end
+
+                // ---------------------------------------------------------
+                WT_DRAIN: begin
+                    wt_s1_valid <= 1'b0;
+                    if (wt_s1_valid) begin
+                        logic [7:0] bval;
+                        bval = ext_y_data_i[int'(wt_s1_byte_lane)*8 +: 8];
+                        case (wt_pack_lane)
+                            2'd0: wt_pb0 <= bval;
+                            2'd1: wt_pb1 <= bval;
+                            2'd2: wt_pb2 <= bval;
+                            2'd3: wt_pb3 <= bval;
+                        endcase
+                        if (wt_pack_lane == 2'd3) begin
+                            wt_sram_wr   <= AW'(int'(wt_sram_wr) + 1);
+                            wt_pb0       <= '0; wt_pb1 <= '0;
+                            wt_pb2       <= '0; wt_pb3 <= '0;
+                            wt_pack_lane <= '0;
+                            wt_state     <= WT_DONE;
+                        end else begin
+                            wt_pack_lane <= wt_pack_lane + 2'd1;
+                            wt_state     <= WT_FLUSH;
+                        end
+                    end else begin
+                        wt_state <= (wt_pack_lane != 2'd0) ? WT_FLUSH : WT_DONE;
+                    end
+                end
+
+                // ---------------------------------------------------------
+                WT_FLUSH: begin
+                    wt_sram_wr   <= AW'(int'(wt_sram_wr) + 1);
+                    wt_pb0       <= '0; wt_pb1 <= '0;
+                    wt_pb2       <= '0; wt_pb3 <= '0;
+                    wt_pack_lane <= '0;
+                    wt_state     <= WT_DONE;
+                end
+
+                // ---------------------------------------------------------
+                WT_DONE: begin
+                    if (load_ready_o)
+                        wt_state <= WT_IDLE;
+                end
+
+                default: wt_state <= WT_IDLE;
+            endcase
         end
     end
 
     // =========================================================================
-    // Combinational: DRAM X address (LS_FETCH_REQ)
+    // Latch tile geometry on start_i
+    // =========================================================================
+    always_ff @(posedge clk or posedge rst) begin
+        if (rst) begin
+            lat_row_tile    <= '0;
+            lat_col_tile    <= '0;
+            lat_eff_rows    <= '0;
+            lat_eff_cols    <= '0;
+            lat_sram_a_base <= '0;
+            busy_o          <= 1'b0;
+        end else begin
+            if (start_i) begin
+                lat_row_tile    <= row_tile_i;
+                lat_col_tile    <= col_tile_i;
+                lat_eff_rows    <= eff_rows_i;
+                lat_eff_cols    <= eff_cols_i;
+                lat_sram_a_base <= sram_a_base_i;
+                busy_o          <= 1'b1;
+            end
+            if (load_ready_o)
+                busy_o <= 1'b0;
+        end
+    end
+
+    // =========================================================================
+    // load_ready_o: pulse for 1 cycle when both pipelines reach DONE
+    // =========================================================================
+    assign load_ready_o = (act_state == ACT_DONE) && (wt_state == WT_DONE);
+
+    // =========================================================================
+    // Combinational: DRAM X read (activation issue stage)
+    // Driven when ACT_PIPE and there are bytes left to issue.
     // =========================================================================
     always_comb begin
         ext_x_rd_en_o = 1'b0;
         ext_x_addr_o  = '0;
-        if (ls_state == LS_FETCH_REQ) begin
+        if (act_state == ACT_PIPE && int'(act_issue_cnt) < int'(act_total)) begin
             logic        p;
             logic [15:0] wa;
             logic [1:0]  bl;
-            get_im2col(int'(lat_row_tile), int'(ic_row),
-                       int'(ic_col), p, wa, bl);
+            get_im2col(int'(lat_row_tile), int'(act_ic_row), int'(act_ic_col),
+                       p, wa, bl);
             if (!p) begin
                 ext_x_rd_en_o = 1'b1;
                 ext_x_addr_o  = wa;
@@ -494,52 +545,85 @@ module dram_loader #(
     end
 
     // =========================================================================
-    // Combinational: DRAM Y address (LS_FETCH_B_REQ) + SRAM B write (LS_FETCH_B_RSP / LS_FLUSH_B)
+    // Combinational: DRAM Y read (weight issue stage)
+    // Driven when WT_PIPE and there are bytes left to issue.
     // =========================================================================
     always_comb begin
         ext_y_rd_en_o = 1'b0;
         ext_y_addr_o  = '0;
+        if (wt_state == WT_PIPE && int'(wt_issue_cnt) < int'(wt_total)) begin
+            logic [15:0] wa;
+            logic [1:0]  bl;
+            get_weight_addr(int'(wt_tap), int'(lat_col_tile), int'(wt_col), wa, bl);
+            ext_y_rd_en_o = 1'b1;
+            ext_y_addr_o  = wa;
+        end
+    end
+
+    // =========================================================================
+    // Combinational: SRAM A write
+    //
+    // Fires in three situations:
+    //   ACT_PIPE  when act_pack_lane==3 and act_s1_valid: the 4th byte completes
+    //             a full word. The current byte comes directly from ext_x_data_i
+    //             (it is not in act_pb3 yet ? that updates at posedge).
+    //   ACT_DRAIN same condition (receiving final in-flight byte).
+    //   ACT_FLUSH the partial word held in act_pb0..pb3 is written as-is.
+    // =========================================================================
+    always_comb begin
+        sram_a_csb0   = 1'b1;
+        sram_a_web0   = 1'b1;
+        sram_a_wmask0 = 4'hF;
+        sram_a_addr0  = '0;
+        sram_a_din0   = '0;
+
+        if (act_state == ACT_FLUSH) begin
+            sram_a_csb0   = 1'b0;
+            sram_a_web0   = 1'b0;
+            sram_a_wmask0 = 4'hF;
+            sram_a_addr0  = act_sram_wr;
+            sram_a_din0   = {act_pb3, act_pb2, act_pb1, act_pb0};
+
+        end else if ((act_state == ACT_PIPE || act_state == ACT_DRAIN)
+                     && act_s1_valid && act_pack_lane == 2'd3) begin
+            automatic logic [7:0] bval_c;
+            bval_c = act_s1_is_pad ? 8'h00
+                                   : ext_x_data_i[int'(act_s1_byte_lane)*8 +: 8];
+            sram_a_csb0   = 1'b0;
+            sram_a_web0   = 1'b0;
+            sram_a_wmask0 = 4'hF;
+            sram_a_addr0  = act_sram_wr;
+            sram_a_din0   = {bval_c, act_pb2, act_pb1, act_pb0};
+        end
+    end
+
+    // =========================================================================
+    // Combinational: SRAM B write
+    // Mirrors the SRAM A write logic but for weights.
+    // =========================================================================
+    always_comb begin
         sram_b_csb0   = 1'b1;
         sram_b_web0   = 1'b1;
         sram_b_wmask0 = 4'hF;
         sram_b_addr0  = '0;
         sram_b_din0   = '0;
 
-        if (ls_state == LS_FETCH_B_REQ) begin
-            logic [15:0] wa;
-            logic [1:0]  bl;
-            get_weight_addr(int'(wt_tap), int'(lat_col_tile), int'(wt_col), wa, bl);
-            ext_y_rd_en_o = 1'b1;
-            ext_y_addr_o  = wa;
-
-        end else if (ls_state == LS_FLUSH_B) begin
-            automatic logic [31:0] flush_word;
-            flush_word    = {pack_b3, pack_b2, pack_b1, pack_b0};
+        if (wt_state == WT_FLUSH) begin
             sram_b_csb0   = 1'b0;
             sram_b_web0   = 1'b0;
             sram_b_wmask0 = 4'hF;
-            sram_b_addr0  = sram_b_wr;
-            sram_b_din0   = flush_word;
+            sram_b_addr0  = wt_sram_wr;
+            sram_b_din0   = {wt_pb3, wt_pb2, wt_pb1, wt_pb0};
 
-        end else if (ls_state == LS_FETCH_B_RSP) begin
+        end else if ((wt_state == WT_PIPE || wt_state == WT_DRAIN)
+                     && wt_s1_valid && wt_pack_lane == 2'd3) begin
             automatic logic [7:0] bval_c;
-            bval_c = ext_y_data_i[int'(wt_byte_lane)*8 +: 8];
-
-            if (pack_lane == 2'd3) begin
-                automatic logic [31:0] word_c;
-                word_c = {pack_b3, pack_b2, pack_b1, pack_b0};
-                case (pack_lane)
-                    2'd0: word_c[ 7: 0] = bval_c;
-                    2'd1: word_c[15: 8] = bval_c;
-                    2'd2: word_c[23:16] = bval_c;
-                    2'd3: word_c[31:24] = bval_c;
-                endcase
-                sram_b_csb0   = 1'b0;
-                sram_b_web0   = 1'b0;
-                sram_b_wmask0 = 4'hF;
-                sram_b_addr0  = sram_b_wr;
-                sram_b_din0   = word_c;
-            end
+            bval_c = ext_y_data_i[int'(wt_s1_byte_lane)*8 +: 8];
+            sram_b_csb0   = 1'b0;
+            sram_b_web0   = 1'b0;
+            sram_b_wmask0 = 4'hF;
+            sram_b_addr0  = wt_sram_wr;
+            sram_b_din0   = {bval_c, wt_pb2, wt_pb1, wt_pb0};
         end
     end
 
